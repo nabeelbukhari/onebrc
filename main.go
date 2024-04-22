@@ -2,51 +2,246 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/pkg/profile"
 )
 
 type StationData struct {
+	name                  string
 	MaxTemp, MinTemp, Sum float64
 	Count                 int
 }
+
+const (
+	filePath   = "measurements_1B.txt"
+	maxNameLen = 100
+	maxNameNum = 10000
+	mb         = 1024 * 1024 // bytes
+)
 
 func main() {
 	// parse env vars and inputs
 	shouldProfile := os.Getenv("PROFILE") == "true"
 	if shouldProfile {
-		defer profile.Start(profile.ProfilePath("./sequential")).Stop()
+		defer profile.Start(profile.ProfilePath("./parallel-map-hash-parse")).Stop()
 	}
+
+	// start timer
 	start := time.Now()
-	stationData := make(map[string]*StationData, 10000)
 
-	buffersize := 1024 * 1024
-	buffer := make([]byte, buffersize)
+	// final results map
+	stationData := make(map[string]*StationData, maxNameNum)
 
-	file, err := os.Open("measurements_1B.txt")
+	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println(err)
-		return
+		log.Fatal(fmt.Errorf("failed to open %s file: %w", filePath, err))
 	}
 	defer file.Close()
 
-	readUsingBuffer(file, buffer, stationData)
+	fileinfo, err := file.Stat()
+	if err != nil {
+		log.Fatal(fmt.Errorf("failed to read %s file: %w", filePath, err))
+		return
+	}
+
+	parseChunkSize := 1 * mb
+	numParsers := runtime.NumCPU()
+
+	createWorkers(file, fileinfo, numParsers, parseChunkSize, stationData)
 	printResults(stationData)
 	elapsed := time.Since(start)
 	log.Printf("Time took %s", elapsed)
+}
+
+func createWorkers(file *os.File, info os.FileInfo, numParsers int, parseChunkSize int, stationData map[string]*StationData) {
+
+	// kick off "parser" workers
+	wg := sync.WaitGroup{}
+	wg.Add(numParsers)
+
+	// buffered to not block on merging
+	chunkOffsetCh := make(chan int64, numParsers)
+	chunkStatsCh := make(chan *Map[string, *StationData], numParsers)
+
+	go func() {
+		i := 0
+		for i < int(info.Size()) {
+			chunkOffsetCh <- int64(i)
+			i += parseChunkSize
+		}
+		close(chunkOffsetCh)
+	}()
+
+	for i := 0; i < numParsers; i++ {
+		// WARN: w/ extra padding for line overflow. Each chunk should be read past
+		// the intended size to the next new line. 128 bytes should be enough for
+		// a max 100 byte name + the float value.
+		buf := make([]byte, parseChunkSize+128)
+		go func() {
+			stationData := NewHashMap[string, *StationData](maxNameNum)
+			for chunkOffset := range chunkOffsetCh {
+				readUsingBuffer(file, buf, stationData, chunkOffset, parseChunkSize)
+			}
+			chunkStatsCh <- stationData
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(chunkStatsCh)
+	}()
+
+	for chunkStats := range chunkStatsCh {
+		for _, s := range chunkStats.cache {
+			if s == nil {
+				continue
+			}
+			if ms, ok := stationData[s.name]; !ok {
+				stationData[s.name] = s
+			} else {
+				if s.MinTemp < ms.MinTemp {
+					ms.MinTemp = s.MinTemp
+				}
+				if s.MaxTemp > ms.MaxTemp {
+					ms.MaxTemp = s.MaxTemp
+				}
+				ms.Sum += s.Sum
+				ms.Count += s.Count
+			}
+		}
+	}
+}
+
+func readUsingBuffer(file *os.File, buffer []byte, stationData *Map[string, *StationData], offset int64, size int) {
+
+	bytesread, err := file.ReadAt(buffer, offset)
+
+	if err != nil && err != io.EOF {
+		log.Fatal(err)
+	}
+
+	if bytesread == 0 {
+		return
+	}
+
+	fnv1aOffset64 := uint64(14695981039346656037)
+	fnv1aPrime64 := uint64(1099511628211)
+
+	pointer := 0
+	extraLineRead := false
+
+	// skip until first line
+	for {
+		if buffer[pointer] == '\n' {
+			break
+		}
+		pointer++
+	}
+	pointer++
+
+	for {
+		semiColonIndex := -1
+		idHash := uint64(fnv1aOffset64)
+
+		// find the semi-colon and generate hash for name
+		for i := pointer; i < len(buffer); i++ {
+			ch := buffer[i]
+			if ch == ';' {
+				semiColonIndex = i
+				break
+			}
+			// calculate FNV-1a hash
+			idHash ^= uint64(ch)
+			idHash *= fnv1aPrime64
+		}
+
+		// if no semi-colon found, it means we don't have a complete line
+		if semiColonIndex == -1 {
+			fmt.Println("no semi-colon found, skipping line")
+			break
+		}
+
+		numberStartIndex := semiColonIndex + 1
+
+		var temp float64
+		// parse the number
+		{
+			negative := buffer[numberStartIndex] == '-'
+			if negative {
+				numberStartIndex++
+			}
+
+			var temps int64
+			if buffer[numberStartIndex+1] == '.' {
+				// 1.2\n
+				temps = int64(buffer[numberStartIndex])*10 + int64(buffer[numberStartIndex+2]) - '0'*(10+1)
+				// 12.3\n
+			} else {
+				temps = int64(buffer[numberStartIndex])*100 + int64(buffer[numberStartIndex+1])*10 + int64(buffer[numberStartIndex+3]) - '0'*(100+10+1)
+			}
+
+			if negative {
+				temps = -temps
+			}
+
+			temp = float64(temps) / 10.0
+		}
+
+		newLineIndex := -1
+		// find the newline
+		for i := numberStartIndex + 3; i < len(buffer); i++ {
+			if buffer[i] == '\n' {
+				newLineIndex = i
+				break
+			}
+		}
+
+		// if no newline found, it means we don't have a complete line
+		if newLineIndex == -1 {
+			fmt.Println("no newline found, skipping line")
+			break
+		}
+
+		station, found := stationData.GetUsingHash(idHash)
+		if !found {
+			name := string(buffer[pointer:semiColonIndex]) // actually allocate string
+			stationData.SetUsingHash(idHash, &StationData{
+				name:    name,
+				MaxTemp: temp,
+				MinTemp: temp,
+				Sum:     temp,
+				Count:   1,
+			})
+		} else {
+			if temp < station.MinTemp {
+				station.MinTemp = temp
+			}
+			if temp > station.MaxTemp {
+				station.MaxTemp = temp
+			}
+			station.Sum += temp
+			station.Count++
+		}
+		pointer = newLineIndex + 1
+
+		if pointer >= size {
+			if extraLineRead {
+				break
+			}
+			extraLineRead = true
+		}
+	}
 }
 
 func printResults(stationData map[string]*StationData) { // doesn't help
@@ -76,196 +271,4 @@ func printResults(stationData map[string]*StationData) { // doesn't help
 // rounding floats to 1 decimal place with 0.05 rounding up to 0.1
 func round(x float64) float64 {
 	return math.Floor((x+0.05)*10) / 10
-}
-
-// parseFloatFast is a high performance float parser using the assumption that
-// the byte slice will always have a single decimal digit.
-func parseFloatFast(tempBS []byte) float64 {
-	var startIndex int // is negative?
-	if tempBS[0] == '-' {
-		startIndex = 1
-	}
-
-	temperature := float64(tempBS[len(tempBS)-1]-'0') / 10 // single decimal digit
-	place := 1.0
-	for i := len(tempBS) - 3; i >= startIndex; i-- { // integer part
-		temperature += float64(tempBS[i]-'0') * place
-		place *= 10
-	}
-
-	if startIndex == 1 {
-		temperature *= -1
-	}
-	return temperature
-}
-
-func readUsingBuffer(file *os.File, buffer []byte, stationData map[string]*StationData) {
-	bytesread, err := file.Read(buffer)
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	remaining := make([]byte, 0)
-	stationName := make([]byte, 100)
-
-	for bytesread > 0 {
-		pointer := 0
-		for {
-			newLineIndex := -1
-			semiColonIndex := -1
-			newLineFound := false
-			for {
-				if pointer+newLineIndex+1 >= len(buffer) {
-					break
-				}
-				newLineIndex++
-				if buffer[pointer+newLineIndex] == ';' {
-					semiColonIndex = newLineIndex
-					continue
-				}
-				if buffer[pointer+newLineIndex] == '\n' {
-					newLineFound = true
-					break
-				}
-			}
-			// if no newline found, it means we don't have a complete line
-			if newLineFound {
-				currLine := buffer[pointer : pointer+newLineIndex]
-				// how can we get rid of this
-				if len(remaining) > 0 {
-					currLine = append(remaining, currLine...)
-					remaining = remaining[:0]
-				}
-				if semiColonIndex == -1 {
-					semiColonIndex = bytes.IndexByte(currLine, ';')
-				}
-				if semiColonIndex > 0 {
-					nameLen := copy(stationName, currLine[:semiColonIndex])
-					temp := parseFloatFast(currLine[semiColonIndex+1:])
-					nameUnsafe := unsafe.String(&stationName[0], nameLen)
-					station, found := stationData[nameUnsafe]
-					if !found {
-						name := string(stationName[:nameLen]) // actually allocate string
-						stationData[name] = &StationData{
-							MaxTemp: temp,
-							MinTemp: temp,
-							Sum:     temp,
-							Count:   1,
-						}
-					} else {
-						if temp < station.MinTemp {
-							station.MinTemp = temp
-						}
-						if temp > station.MaxTemp {
-							station.MaxTemp = temp
-						}
-						station.Sum += temp
-						station.Count++
-					}
-				}
-				pointer = pointer + newLineIndex + 1
-			} else {
-				remaining = append(remaining, buffer[pointer:]...)
-				break
-			}
-		}
-
-		bytesread, err = file.Read(buffer)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-
-			log.Fatalf("read file line error: %v", err)
-			return
-		}
-	}
-}
-
-func readCompleteFile(filename string) {
-	bytes, err := ioutil.ReadFile(filename)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("Bytes read: ", len(bytes))
-}
-
-func processFile(filename string) {
-	f, err := os.Open(filename)
-	if err != nil {
-		log.Fatalf("Open: %v", err)
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		log.Fatalf("Stat: %v", err)
-	}
-
-	size := fi.Size()
-	if size <= 0 || size != int64(int(size)) {
-		log.Fatalf("Invalid file size: %d", size)
-	}
-
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		log.Fatalf("Mmap: %v", err)
-	}
-
-	defer func() {
-		if err := syscall.Munmap(data); err != nil {
-			log.Fatalf("Munmap: %v", err)
-		}
-	}()
-}
-
-func readWithScanner(file *os.File, stationData map[string]*StationData) {
-	_, err := file.Stat()
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// buffersize := fileinfo.Size()
-	buffersize := 1024 * 1024
-	buffer := make([]byte, buffersize)
-	// Create a scanner object that reads from the file
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(buffer, int(buffersize))
-	scanner.Split(bufio.ScanLines)
-
-	// Returns a boolean based on whether there's a next instance of `\n`
-	// character in the IO stream. This step also advances the internal pointer
-	// to the next position (after '\n') if it did find that token.
-	read := scanner.Scan()
-
-	for read {
-		// fmt.Println("read string: ", scanner.Text())
-		test := scanner.Text()
-		splitted := strings.Split(test, ";")
-		stationname := splitted[0]
-		temp, error := strconv.ParseFloat(splitted[1], 32)
-		if error != nil {
-			fmt.Println("Error parsing float: ", error)
-			return
-		}
-		station, found := stationData[stationname]
-		if !found {
-			stationData[stationname] = &StationData{
-				MaxTemp: temp,
-				MinTemp: temp,
-				Sum:     temp,
-				Count:   1,
-			}
-		} else {
-			station.MaxTemp = math.Max(temp, station.MaxTemp)
-			station.MinTemp = math.Min(temp, station.MinTemp)
-			station.Sum = temp + station.Sum
-			station.Count++
-		}
-		read = scanner.Scan()
-	}
 }
