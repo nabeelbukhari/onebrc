@@ -1,8 +1,12 @@
 package main
 
+import (
+	"sync/atomic"
+)
+
 type entry struct {
 	key uint64
-	mid int
+	mid int32
 }
 
 const (
@@ -14,21 +18,33 @@ const (
 	Init64 = offset64
 
 	// use power of 2 for fast modulo calculation
-	nBuckets = 1 << 12
+	nBuckets = 1 << 17
 )
 
 type (
 	Map[K string | []byte, V any] struct {
-		buckets [][]entry
-		cache   []V
+		pointer        int32
+		bucketsPoniter []int32
+		buckets        [][]entry
+		cache          []V
 	}
 )
 
 func NewHashMap[K string, T any](size uint64) *Map[K, T] {
 	buckets := make([][]entry, nBuckets)
-	cache := make([]T, 0, size)
+	bucketsPoniter := make([]int32, nBuckets)
+	for i := range buckets {
+		bucketsPoniter[i] = -1
+		buckets[i] = make([]entry, 5)
+	}
+	cache := make([]T, size, size)
 
-	return &Map[K, T]{buckets: buckets, cache: cache}
+	return &Map[K, T]{pointer: 0, buckets: buckets, bucketsPoniter: bucketsPoniter, cache: cache}
+}
+
+func hashToIndex(hash uint64, len uint64) uint64 {
+	hashAsInt := hash ^ (hash >> 33) ^ (hash >> 15)
+	return (hashAsInt & (len - 1))
 }
 
 func (m *Map[K, V]) Get(key string) (V, bool) {
@@ -44,7 +60,7 @@ func (m *Map[K, V]) Get(key string) (V, bool) {
 }
 
 func (m *Map[K, V]) GetUsingHash(hash uint64) (V, bool) {
-	i := hash & uint64(nBuckets-1)
+	i := hashToIndex(hash, uint64(nBuckets-1))
 	for j := 0; j < len(m.buckets[i]); j++ {
 		e := &m.buckets[i][j]
 		if e.key == hash {
@@ -55,15 +71,18 @@ func (m *Map[K, V]) GetUsingHash(hash uint64) (V, bool) {
 }
 
 func (m *Map[K, V]) SetUsingHash(hash uint64, value V) {
-	i := hash & uint64(nBuckets-1)
-	m.buckets[i] = append(m.buckets[i], entry{key: hash, mid: len(m.cache)})
-	m.cache = append(m.cache, value)
+	i := hashToIndex(hash, uint64(nBuckets-1))
+	m.pointer += 1
+	m.bucketsPoniter[i] += 1
+	m.buckets[i][m.bucketsPoniter[i]] = entry{key: hash, mid: m.pointer}
+	m.cache[m.pointer] = value
 }
 
 func (m *Map[K, V]) SetBytes(key []byte, value V) {
 	hash := HashBytes64(key)
 	i := hash & uint64(nBuckets-1)
-	m.buckets[i] = append(m.buckets[i], entry{key: hash, mid: len(m.cache)})
+	index := atomic.AddInt32(&m.pointer, 1)
+	m.buckets[i] = append(m.buckets[i], entry{key: hash, mid: index})
 	m.cache = append(m.cache, value)
 }
 
